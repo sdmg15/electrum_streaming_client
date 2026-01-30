@@ -16,7 +16,7 @@ models.
 ## Example (async with Tokio)
 
 ```rust,no_run
-use electrum_streaming_client::{AsyncClient, AsyncBatchRequest, Event};
+use electrum_streaming_client::{AsyncClient, Event};
 use tokio::net::TcpStream;
 use futures::StreamExt;
 
@@ -28,11 +28,7 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::spawn(worker); // spawn the client worker task
 
-    let mut batch = AsyncBatchRequest::new();
-    let fut = batch.request(electrum_streaming_client::request::RelayFee);
-    client.send_batch(batch)?;
-    let relay_fee = fut.await?;
-
+    let relay_fee = client.send_request(electrum_streaming_client::request::RelayFee).await?;
     println!("Relay fee: {relay_fee:?}");
 
     while let Some(event) = events.next().await {

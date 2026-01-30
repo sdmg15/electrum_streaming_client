@@ -39,26 +39,18 @@ pub type ResponseResult<Resp> = Result<Resp, ResponseError>;
 /// Internal type aliases for asynchronous client components.
 mod async_aliases {
     use super::*;
-    use futures::channel::{
-        mpsc::{TrySendError, UnboundedReceiver, UnboundedSender},
-        oneshot::{Receiver, Sender},
-    };
-    use pending_request::AsyncPendingRequest;
-
-    /// Internal [`State`] instance specialized for tracking asynchronous requests.
-    ///
-    /// Used by the async client to associate incoming responses with pending requests.
-    pub type AsyncState = State<AsyncPendingRequest>;
+    use futures::channel::mpsc::{TrySendError, UnboundedReceiver, UnboundedSender};
+    use pending_request::PendingRequest;
 
     /// The sending half of the channel used to enqueue one or more requests from [`AsyncClient`].
     ///
     /// These requests are processed and forwarded to [`State::track_request`] to be assigned an ID and serialized.
-    pub type AsyncRequestSender = UnboundedSender<MaybeBatch<AsyncPendingRequest>>;
+    pub type AsyncRequestSender = UnboundedSender<MaybeBatch<PendingRequest>>;
 
     /// The receiving half of the request channel used internally by the async client.
     ///
     /// Requests sent by [`AsyncClient`] are dequeued here and forwarded to [`State::track_request`].
-    pub type AsyncRequestReceiver = UnboundedReceiver<MaybeBatch<AsyncPendingRequest>>;
+    pub type AsyncRequestReceiver = UnboundedReceiver<MaybeBatch<PendingRequest>>;
 
     /// The error returned by [`AsyncClient::send_request`] when a request fails.
     ///
@@ -67,18 +59,8 @@ mod async_aliases {
 
     /// The error that occurs when a request cannot be sent into the async request channel.
     ///
-    /// This typically means the client’s background task has shut down or the queue is disconnected.
-    pub type AsyncRequestSendError = TrySendError<MaybeBatch<AsyncPendingRequest>>;
-
-    /// A oneshot sender used to deliver the result of a tracked async request.
-    ///
-    /// Used internally by the client to fulfill the future returned by [`AsyncBatchRequest::request`].
-    pub type AsyncResponseSender<Resp> = Sender<ResponseResult<Resp>>;
-
-    /// A oneshot receiver used to await the result of a tracked async request.
-    ///
-    /// Awaiting this will yield the final response or error once the server replies.
-    pub type AsyncResponseReceiver<Resp> = Receiver<ResponseResult<Resp>>;
+    /// This typically means the client's background task has shut down or the queue is disconnected.
+    pub type AsyncRequestSendError = TrySendError<MaybeBatch<PendingRequest>>;
 
     /// The sending half of the internal event stream, used to emit [`Event`]s from the client worker loop.
     pub type AsyncEventSender = UnboundedSender<Event>;
@@ -93,17 +75,14 @@ pub use async_aliases::*;
 /// Internal type aliases for blocking client components.
 mod blocking_aliases {
     use super::*;
-    use pending_request::BlockingPendingRequest;
-    use std::sync::mpsc::{Receiver, SendError, Sender, SyncSender};
-
-    /// Internal [`State`] specialized for tracking blocking requests.
-    pub type BlockingState = State<BlockingPendingRequest>;
+    use pending_request::PendingRequest;
+    use std::sync::mpsc::{Receiver, SendError, Sender};
 
     /// Channel sender for sending blocking requests from [`BlockingClient`] to the write thread.
-    pub type BlockingRequestSender = Sender<MaybeBatch<BlockingPendingRequest>>;
+    pub type BlockingRequestSender = Sender<MaybeBatch<PendingRequest>>;
 
     /// Channel receiver used by the write thread to dequeue pending requests.
-    pub type BlockingRequestReceiver = Receiver<MaybeBatch<BlockingPendingRequest>>;
+    pub type BlockingRequestReceiver = Receiver<MaybeBatch<PendingRequest>>;
 
     /// Error returned by [`BlockingClient::send_request`] if the request fails or is canceled.
     pub type BlockingRequestError = request::Error<BlockingRequestSendError>;
@@ -111,13 +90,7 @@ mod blocking_aliases {
     /// Error that occurs when a blocking request cannot be sent to the internal request channel.
     ///
     /// Typically indicates that the client has been shut down.
-    pub type BlockingRequestSendError = SendError<MaybeBatch<BlockingPendingRequest>>;
-
-    /// One-shot sender used to deliver the result of a tracked blocking request.
-    pub type BlockingResponseSender<Resp> = SyncSender<ResponseResult<Resp>>;
-
-    /// One-shot receiver used to block and wait for a response to a tracked request.
-    pub type BlockingResponseReceiver<Resp> = Receiver<ResponseResult<Resp>>;
+    pub type BlockingRequestSendError = SendError<MaybeBatch<PendingRequest>>;
 
     /// Channel sender used by the read thread to emit [`Event`]s.
     pub type BlockingEventSender = Sender<Event>;
@@ -171,7 +144,7 @@ pub struct RawNotification {
 
 /// A raw JSON-RPC response from the Electrum server.
 ///
-/// This is the server’s response to a client-issued request. It may contain either a `result`
+/// This is the server's response to a client-issued request. It may contain either a `result`
 /// or an `error` (as per the JSON-RPC spec).
 #[derive(Debug, Clone, serde::Deserialize)]
 #[allow(clippy::manual_non_exhaustive)]

@@ -1,35 +1,30 @@
-use crate::*;
+use crate::pending_request::{PendingRequest, RequestExt};
+use crate::{MaybeBatch, ResponseResult};
 
-/// A builder for batching multiple asynchronous requests to the Electrum server.
+/// A builder for batching multiple requests to the Electrum server.
 ///
 /// This type allows queuing both:
-/// - tracked requests via [`request`] (which return a [`Future`] that resolves to a response), and
-/// - event-style requests via [`event_request`] (which emit [`Event`]s through the
-///   [`AsyncEventReceiver`] instead of a future).
+/// - tracked requests via [`request`] (which take a callback to receive the typed response), and
+/// - event-style requests via [`event_request`] (which emit [`Event`]s through the event receiver
+///   instead of a callback).
 ///
-/// After building the batch, submit it using [`AsyncClient::send_batch`]. The batch will be
-/// converted into a raw JSON-RPC message and sent to the server.
-///
-/// **Important:** Do not `.await` any futures returned by [`request`] until *after* the batch has
-/// been sent. Doing so will cause the future to block indefinitely, as the request ID is not yet
-/// assigned and the response cannot be matched.
-///
-/// This type is useful for reducing round-trips and issuing dependent or related requests together.
+/// After building the batch, submit it using [`AsyncClient::send_batch`] or
+/// [`BlockingClient::send_batch`]. The batch will be converted into a raw JSON-RPC message and
+/// sent to the server.
 ///
 /// [`request`]: Self::request
 /// [`event_request`]: Self::event_request
-/// [`Future`]: core::future::Future
 /// [`AsyncClient::send_batch`]: crate::AsyncClient::send_batch
-/// [`AsyncEventReceiver`]: crate::AsyncEventReceiver
+/// [`BlockingClient::send_batch`]: crate::BlockingClient::send_batch
 /// [`Event`]: crate::Event
 #[must_use]
 #[derive(Debug, Default)]
-pub struct AsyncBatchRequest {
-    inner: Option<MaybeBatch<AsyncPendingRequest>>,
+pub struct BatchRequest {
+    inner: Option<MaybeBatch<PendingRequest>>,
 }
 
-impl AsyncBatchRequest {
-    /// Creates a new empty async batch request builder.
+impl BatchRequest {
+    /// Creates a new empty batch request builder.
     pub fn new() -> Self {
         Self::default()
     }
@@ -37,150 +32,79 @@ impl AsyncBatchRequest {
     /// Consumes the batch and returns its raw contents, if any requests were added.
     ///
     /// Returns `Some` if the batch is non-empty, or `None` if it was empty.
-    ///
-    /// This is used internally by [`AsyncClient::send_batch`] to extract the batched request set.
-    ///
-    /// [`AsyncClient::send_batch`]: crate::AsyncClient::send_batch
-    pub fn into_inner(self) -> Option<MaybeBatch<AsyncPendingRequest>> {
+    pub fn into_inner(self) -> Option<MaybeBatch<PendingRequest>> {
         self.inner
     }
 
-    /// Adds a tracked request to the batch and returns a [`Future`] that resolves to the response.
+    /// Adds a tracked request to the batch with a typed callback.
     ///
-    /// This request will be tracked internally. The returned future must only be `.await`ed
-    /// *after* the batch has been submitted with [`AsyncClient::send_batch`]. Awaiting too early
-    /// will block forever.
+    /// The callback will be invoked with the deserialized response (or error) once the server
+    /// replies. The callback is type-erased internally, so it works for both async and blocking
+    /// clients.
+    pub fn request<Req, F>(&mut self, req: Req, callback: F)
+    where
+        Req: RequestExt + Send + Sync + 'static,
+        F: FnOnce(ResponseResult<Req::Response>) + Send + Sync + 'static,
+    {
+        MaybeBatch::push_opt(&mut self.inner, PendingRequest::new(req, Some(callback)));
+    }
+
+    /// Adds a tracked request and returns an async receiver for the response.
     ///
-    /// # Errors
-    /// Returns an error if the request could not be added (e.g., duplicate or overflow).
-    ///
-    /// [`Future`]: futures::Future
-    /// [`AsyncClient::send_batch`]: crate::AsyncClient::send_batch
-    pub fn request<Req>(
+    /// This is a convenience wrapper around [`request`](Self::request) that creates a
+    /// [`futures::channel::oneshot`] channel internally. The returned receiver can be
+    /// `.await`ed after the batch is sent.
+    pub fn request_async<Req>(
         &mut self,
         req: Req,
-    ) -> impl std::future::Future<Output = Result<Req::Response, BatchRequestError>>
-           + Send
-           + Sync
-           + 'static
+    ) -> futures::channel::oneshot::Receiver<ResponseResult<Req::Response>>
     where
-        Req: Request,
-        AsyncPendingRequestTuple<Req, Req::Response>: Into<AsyncPendingRequest>,
+        Req: RequestExt + Send + Sync + 'static,
+        Req::Response: Send,
     {
-        let (resp_tx, resp_rx) = futures::channel::oneshot::channel();
-        MaybeBatch::push_opt(&mut self.inner, (req, Some(resp_tx)).into());
-        async move {
-            resp_rx
-                .await
-                .map_err(|_| BatchRequestError::Canceled)?
-                .map_err(BatchRequestError::Response)
-        }
+        let (tx, rx) = futures::channel::oneshot::channel();
+        self.request(req, move |result| {
+            let _ = tx.send(result);
+        });
+        rx
+    }
+
+    /// Adds a tracked request and returns a blocking receiver for the response.
+    ///
+    /// This is a convenience wrapper around [`request`](Self::request) that creates a
+    /// [`std::sync::mpsc::sync_channel`] internally. The returned receiver can be used
+    /// with [`recv`](std::sync::mpsc::Receiver::recv) after the batch is sent.
+    pub fn request_blocking<Req>(
+        &mut self,
+        req: Req,
+    ) -> std::sync::mpsc::Receiver<ResponseResult<Req::Response>>
+    where
+        Req: RequestExt + Send + Sync + 'static,
+        Req::Response: Send,
+    {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.request(req, move |result| {
+            let _ = tx.send(result);
+        });
+        rx
     }
 
     /// Adds an event-style request to the batch.
     ///
-    /// These requests do not return a future and will not be tracked internally. Any server
-    /// response (including the initial result and any future notifications) will be delivered as
-    /// [`Event`]s through the [`AsyncEventReceiver`] stream.
+    /// These requests do not take a callback. Any server response (including the initial result
+    /// and any future notifications) will be delivered as [`Event`]s through the event receiver.
     ///
     /// Use this for subscription-style RPCs where responses should be handled uniformly as events.
     ///
     /// [`Event`]: crate::Event
-    /// [`AsyncEventReceiver`]: crate::AsyncEventReceiver
-    pub fn event_request<Req>(&mut self, request: Req)
-    where
-        Req: Request,
-        AsyncPendingRequestTuple<Req, Req::Response>: Into<AsyncPendingRequest>,
-    {
-        MaybeBatch::push_opt(&mut self.inner, (request, None).into());
+    pub fn event_request<Req: RequestExt + Send + Sync + 'static>(&mut self, req: Req) {
+        MaybeBatch::push_opt(&mut self.inner, PendingRequest::event(req));
     }
 }
 
-/// A builder for batching multiple blocking requests to the Electrum server.
+/// An error that can occur when sending a request or polling its result.
 ///
-/// This type allows queuing both:
-/// - tracked requests via [`request`] (which return blocking receivers for the responses), and
-/// - event-style requests via [`event_request`] (which emit [`Event`]s through the
-///   [`BlockingEventReceiver`] instead of a response handle).
-///
-/// After building the batch, submit it using [`BlockingClient::send_batch`]. The batch will be
-/// serialized and sent to the server in a single write.
-///
-/// **Important:** Do not call `.recv()` on any response receivers returned by [`request`] until
-/// *after* the batch has been sent. Receiving early will block forever, as the request has not yet
-/// been transmitted and the ID not assigned.
-///
-/// [`request`]: Self::request
-/// [`event_request`]: Self::event_request
-/// [`BlockingClient::send_batch`]: crate::BlockingClient::send_batch
-/// [`BlockingEventReceiver`]: crate::BlockingEventReceiver
-/// [`Event`]: crate::Event
-#[must_use]
-#[derive(Debug, Default)]
-pub struct BlockingBatchRequest {
-    inner: Option<MaybeBatch<BlockingPendingRequest>>,
-}
-
-impl BlockingBatchRequest {
-    /// Creates a new empty blocking batch request builder.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Consumes the batch and returns its raw contents, if any requests were added.
-    ///
-    /// Returns `Some` if the batch is non-empty, or `None` if it was empty.
-    ///
-    /// This is used internally by [`BlockingClient::send_batch`] to extract the batched request set.
-    ///
-    /// [`BlockingClient::send_batch`]: crate::BlockingClient::send_batch
-    pub fn into_inner(self) -> Option<MaybeBatch<BlockingPendingRequest>> {
-        self.inner
-    }
-
-    /// Adds a tracked request to the batch and returns a receiver for the response.
-    ///
-    /// This request will be tracked internally. The returned receiver must only be used
-    /// *after* the batch has been submitted with [`BlockingClient::send_batch`].
-    /// Calling `.recv()` or `.wait()` too early will block indefinitely.
-    ///
-    /// # Errors
-    /// Returns an error if the request could not be added (e.g., duplicate or overflow).
-    ///
-    /// [`BlockingClient::send_batch`]: crate::BlockingClient::send_batch
-    pub fn request<Req>(&mut self, req: Req) -> BlockingResponseReceiver<Req::Response>
-    where
-        Req: Request,
-        BlockingPendingRequestTuple<Req, Req::Response>: Into<BlockingPendingRequest>,
-    {
-        let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(1);
-        MaybeBatch::push_opt(&mut self.inner, (req, Some(resp_tx)).into());
-        resp_rx
-    }
-
-    /// Adds an event-style request to the batch.
-    ///
-    /// These requests do not return a receiver and will not be tracked internally. Any server
-    /// response (including the initial result and any future notifications) will be delivered as
-    /// [`Event`]s through the [`BlockingEventReceiver`] stream.
-    ///
-    /// Use this for subscription-style RPCs where responses should be handled uniformly as events.
-    ///
-    /// [`Event`]: crate::Event
-    /// [`BlockingEventReceiver`]: crate::BlockingEventReceiver
-    pub fn event_request<Req>(&mut self, request: Req)
-    where
-        Req: Request,
-        BlockingPendingRequestTuple<Req, Req::Response>: Into<BlockingPendingRequest>,
-    {
-        MaybeBatch::push_opt(&mut self.inner, (request, None).into());
-    }
-}
-
-/// An error that can occur when adding a request to a batch or polling its result.
-///
-/// This error is returned by [`AsyncBatchRequest::request`] or [`BlockingBatchRequest::request`]
-/// when the future or receiver representing the response cannot complete.
+/// This error is returned by client `send_request` methods when the response cannot be obtained.
 ///
 /// It typically indicates that the batch was dropped, the client shut down, or the request
 /// failed to be processed internally.
@@ -194,7 +118,7 @@ pub enum BatchRequestError {
     /// The server returned a response error.
     ///
     /// This indicates that the Electrum server replied with an error object, rather than a result.
-    Response(ResponseError),
+    Response(crate::ResponseError),
 }
 
 impl std::fmt::Display for BatchRequestError {

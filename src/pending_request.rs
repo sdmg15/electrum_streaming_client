@@ -1,20 +1,20 @@
-use crate::{AsyncResponseSender, BlockingResponseSender, MethodAndParams, Request, ResponseError};
+use crate::{Event, MethodAndParams, Request, ResponseError, ResponseResult};
+use serde_json::Value;
 
-/// A tracked or untracked asynchronous request, paired with an optional response sender.
+/// Extension trait for request types that can construct [`SatisfiedRequest`] and [`ErroredRequest`].
 ///
-/// If `Some(sender)` is present, the response will be delivered through it.
-/// If `None`, the response is expected to be emitted as an [`Event`] instead.
+/// This trait is automatically implemented for all built-in request types via the
+/// [`gen_pending_request_types!`] macro. It bridges a typed request to the enum variants used in
+/// [`Event`].
 ///
 /// [`Event`]: crate::Event
-pub type AsyncPendingRequestTuple<Req, Resp> = (Req, Option<AsyncResponseSender<Resp>>);
+pub trait RequestExt: Request + Sized {
+    /// Wraps this request and its decoded response into a [`SatisfiedRequest`].
+    fn into_satisfied(self, resp: Self::Response) -> SatisfiedRequest;
 
-/// A tracked or untracked blocking request, paired with an optional response sender.
-///
-/// If `Some(sender)` is present, the response will be sent through it.
-/// If `None`, the response is expected to be emitted as an [`Event`] instead.
-///
-/// [`Event`]: crate::Event
-pub type BlockingPendingRequestTuple<Req, Resp> = (Req, Option<BlockingResponseSender<Resp>>);
+    /// Wraps this request and an error into an [`ErroredRequest`].
+    fn into_errored(self, error: ResponseError) -> ErroredRequest;
+}
 
 macro_rules! gen_pending_request_types {
     ($($name:ident),*) => {
@@ -27,7 +27,7 @@ macro_rules! gen_pending_request_types {
         /// `SatisfiedRequest` is used by the [`Event::Response`] variant to expose typed
         /// request-response pairs to the caller.
         ///
-        /// You typically don’t construct this manually — it is created internally by the client
+        /// You typically don't construct this manually — it is created internally by the client
         /// after decoding JSON-RPC responses.
         ///
         /// [`Event::Response`]: crate::Event::Response
@@ -69,199 +69,16 @@ macro_rules! gen_pending_request_types {
 
         impl std::error::Error for ErroredRequest {}
 
-        /// A trait representing a request that has been sent to the Electrum server and is awaiting
-        /// a response.
-        ///
-        /// This trait is used internally to track the lifecycle of a request, including:
-        /// - extracting its method and parameters before sending,
-        /// - handling a successful server response,
-        /// - handling an error response.
-        ///
-        /// Both [`AsyncPendingRequest`] and [`BlockingPendingRequest`] implement this trait.
-        /// These are generated enums that hold the original request and, optionally, a response
-        /// channel.
-        ///
-        /// You should not implement this trait manually — it is only used inside the client engine
-        /// for matching raw Electrum responses to typed results.
-        ///
-        /// [`AsyncPendingRequest`]: crate::pending_request::AsyncPendingRequest
-        /// [`BlockingPendingRequest`]: crate::pending_request::BlockingPendingRequest
-        pub trait PendingRequest {
-            /// Returns the Electrum method name and parameters for this request.
-            ///
-            /// This is used to serialize the request into a JSON-RPC message before sending it to
-            /// the server.
-            ///
-            /// The method and parameters must match the format expected by the Electrum protocol.
-            fn to_method_and_params(&self) -> MethodAndParams;
-
-            /// Attempts to decode a successful server response (`result`) into a typed value.
-            ///
-            /// This is called when a matching response arrives from the server. If the request was
-            /// tracked, this method deserializes the response and either:
-            /// - completes the associated response channel (if present), or
-            /// - returns a [`SatisfiedRequest`] directly, if untracked.
-            ///
-            /// Returns an error if deserialization fails.
-            ///
-            /// [`SatisfiedRequest`]: crate::SatisfiedRequest
-            fn satisfy(self, raw_resp: serde_json::Value) -> Result<Option<SatisfiedRequest>, serde_json::Error>;
-
-            /// Handles a server-side error response (`error`) for this request.
-            ///
-            /// If the request was tracked, this sends the error through the associated response
-            /// channel. Otherwise, it returns a [`ErroredRequest`] containing the original request
-            /// and the error.
-            ///
-            /// [`ErroredRequest`]: crate::ErroredRequest
-            fn satisfy_error(self, raw_error: serde_json::Value) -> Option<ErroredRequest>;
-        }
-
-        /// An internal representation of a pending asynchronous Electrum request.
-        ///
-        /// Each variant corresponds to a specific request type. The enum holds:
-        /// - the original request (`req`), and
-        /// - an optional response channel (`resp_tx`) that will be completed once a server response
-        ///   is received.
-        ///
-        /// This type is created when calling [`AsyncBatchRequest::request`] or
-        /// [`AsyncBatchRequest::event_request`], and is consumed by the client when processing
-        /// responses.
-        ///
-        /// If `resp_tx` is present, the request is tracked and its response will complete the
-        /// associated future. If `resp_tx` is `None`, the response will be delivered as an
-        /// [`Event`] instead.
-        ///
-        /// You typically don’t construct this type directly — it is produced by the batch builder
-        /// or macros.
-        ///
-        /// [`AsyncBatchRequest::request`]: crate::AsyncBatchRequest::request
-        /// [`AsyncBatchRequest::event_request`]: crate::AsyncBatchRequest::event_request
-        /// [`Event`]: crate::Event
-        #[derive(Debug)]
-        pub enum AsyncPendingRequest {
-            $($name {
-                req: crate::request::$name,
-                resp_tx: Option<AsyncResponseSender<<crate::request::$name as Request>::Response>>,
-            }),*,
-        }
-
         $(
-            impl From<AsyncPendingRequestTuple<crate::request::$name, <crate::request::$name as Request>::Response>> for AsyncPendingRequest {
-                fn from((req, resp_tx): AsyncPendingRequestTuple<crate::request::$name, <crate::request::$name as Request>::Response>) -> Self {
-                    Self::$name{ req, resp_tx }
+            impl RequestExt for crate::request::$name {
+                fn into_satisfied(self, resp: <Self as Request>::Response) -> SatisfiedRequest {
+                    SatisfiedRequest::$name { req: self, resp }
+                }
+                fn into_errored(self, error: ResponseError) -> ErroredRequest {
+                    ErroredRequest::$name { req: self, error }
                 }
             }
         )*
-
-        impl PendingRequest for AsyncPendingRequest {
-            fn to_method_and_params(&self) -> MethodAndParams {
-                match self {
-                    $(AsyncPendingRequest::$name{ req, .. } => req.to_method_and_params()),*
-                }
-            }
-
-            fn satisfy(self, raw_resp: serde_json::Value) -> Result<Option<SatisfiedRequest>, serde_json::Error> {
-                use crate::request;
-                match self {
-                    $(Self::$name{ req, resp_tx } => {
-                        let resp = serde_json::from_value::<<request::$name as Request>::Response>(raw_resp)?;
-                        Ok(match resp_tx {
-                            Some(tx) => {
-                                let _ = tx.send(Ok(resp));
-                                None
-                            }
-                            None => Some(SatisfiedRequest::$name { req, resp }),
-                        })
-                    }),*
-                }
-            }
-
-            fn satisfy_error(self, raw_error: serde_json::Value) -> Option<ErroredRequest> {
-                let error = ResponseError(raw_error);
-                match self {
-                    $(Self::$name{ req, resp_tx } => {
-                        match resp_tx {
-                            Some(tx) => { let _ = tx.send(Err(error)); None }
-                            None => Some(ErroredRequest::$name{ req, error }),
-                        }
-                    }),*
-                }
-            }
-        }
-
-        /// An internal representation of a pending blocking Electrum request.
-        ///
-        /// Each variant corresponds to a specific request type. The enum holds:
-        /// - the original request (`req`), and
-        /// - an optional response channel (`resp_tx`) that will be fulfilled once a server response
-        ///   is received.
-        ///
-        /// This type is created when calling [`BlockingBatchRequest::request`] or
-        /// [`BlockingBatchRequest::event_request`], and is consumed by the client when processing
-        /// server responses.
-        ///
-        /// If `resp_tx` is present, the request is tracked and the response will be sent through
-        /// the associated receiver. If `resp_tx` is `None`, the response will be delivered as an
-        /// [`Event`] instead.
-        ///
-        /// This type is used internally by the blocking client and is typically not constructed
-        /// directly.
-        ///
-        /// [`BlockingBatchRequest::request`]: crate::BlockingBatchRequest::request
-        /// [`BlockingBatchRequest::event_request`]: crate::BlockingBatchRequest::event_request
-        /// [`Event`]: crate::Event
-        #[derive(Debug)]
-        pub enum BlockingPendingRequest {
-            $($name {
-                req: crate::request::$name,
-                resp_tx: Option<BlockingResponseSender<<crate::request::$name as Request>::Response>>,
-            }),*,
-        }
-
-        $(
-            impl From<BlockingPendingRequestTuple<crate::request::$name, <crate::request::$name as Request>::Response>> for BlockingPendingRequest {
-                fn from((req, resp_tx): BlockingPendingRequestTuple<crate::request::$name, <crate::request::$name as Request>::Response>) -> Self {
-                    Self::$name{ req, resp_tx }
-                }
-            }
-        )*
-
-        impl PendingRequest for BlockingPendingRequest {
-            fn to_method_and_params(&self) -> MethodAndParams {
-                match self {
-                    $(BlockingPendingRequest::$name{ req, .. } => req.to_method_and_params()),*
-                }
-            }
-
-            fn satisfy(self, raw_resp: serde_json::Value) -> Result<Option<SatisfiedRequest>, serde_json::Error> {
-                use crate::request;
-                match self {
-                    $(Self::$name{ req, resp_tx } => {
-                        let resp = serde_json::from_value::<<request::$name as Request>::Response>(raw_resp)?;
-                        Ok(match resp_tx {
-                            Some(tx) => {
-                                let _ = tx.send(Ok(resp));
-                                None
-                            }
-                            None => Some(SatisfiedRequest::$name { req, resp }),
-                        })
-                    }),*
-                }
-            }
-
-            fn satisfy_error(self, raw_error: serde_json::Value) -> Option<ErroredRequest> {
-                let error = ResponseError(raw_error);
-                match self {
-                    $(Self::$name{ req, resp_tx } => {
-                        match resp_tx {
-                            Some(tx) => { let _ = tx.send(Err(error)); None }
-                            None => Some(ErroredRequest::$name{ req, error }),
-                        }
-                    }),*
-                }
-            }
-        }
     };
 }
 
@@ -289,19 +106,95 @@ gen_pending_request_types! {
     Custom
 }
 
-impl<A: PendingRequest> PendingRequest for Box<A> {
-    fn to_method_and_params(&self) -> MethodAndParams {
-        self.as_ref().to_method_and_params()
+/// A pending request that has been sent to the Electrum server and is awaiting a response.
+///
+/// This struct holds a type-erased handler closure that knows how to deserialize the server's
+/// raw JSON response and either:
+/// - dispatch it through a callback (for tracked requests), or
+/// - construct an [`Event`] (for event-style requests).
+///
+/// Construct via [`PendingRequest::new`] (with a callback) or [`PendingRequest::event`] (without).
+///
+/// [`Event`]: crate::Event
+pub struct PendingRequest {
+    method_and_params: MethodAndParams,
+    handler: Box<
+        dyn FnOnce(Result<Value, Value>) -> Result<Option<Event>, serde_json::Error> + Send + Sync,
+    >,
+}
+
+impl PendingRequest {
+    /// Creates a new pending request with an optional typed callback.
+    ///
+    /// If `callback` is `Some`, the response will be deserialized and dispatched through it,
+    /// and [`State::process_incoming`] will return `Ok(None)` for this request.
+    ///
+    /// If `callback` is `None`, the response will be wrapped in an [`Event`] and returned from
+    /// [`State::process_incoming`].
+    ///
+    /// [`State::process_incoming`]: crate::State::process_incoming
+    /// [`Event`]: crate::Event
+    pub fn new<Req: RequestExt + Send + Sync + 'static>(
+        req: Req,
+        callback: Option<impl FnOnce(ResponseResult<Req::Response>) + Send + Sync + 'static>,
+    ) -> Self {
+        let method_and_params = req.to_method_and_params();
+        Self {
+            method_and_params,
+            handler: Box::new(move |raw_result| match (raw_result, callback) {
+                (Ok(raw_resp), Some(cb)) => {
+                    let resp = serde_json::from_value(raw_resp)?;
+                    cb(Ok(resp));
+                    Ok(None)
+                }
+                (Ok(raw_resp), None) => {
+                    let resp = serde_json::from_value(raw_resp)?;
+                    Ok(Some(Event::Response(req.into_satisfied(resp))))
+                }
+                (Err(raw_err), Some(cb)) => {
+                    cb(Err(ResponseError(raw_err)));
+                    Ok(None)
+                }
+                (Err(raw_err), None) => Ok(Some(Event::ResponseError(
+                    req.into_errored(ResponseError(raw_err)),
+                ))),
+            }),
+        }
     }
 
-    fn satisfy(
-        self,
-        raw_resp: serde_json::Value,
-    ) -> Result<Option<SatisfiedRequest>, serde_json::Error> {
-        (*self).satisfy(raw_resp)
+    /// Creates a new pending request without a callback (event-style).
+    ///
+    /// The server's response will be returned as an [`Event`] from [`State::process_incoming`].
+    ///
+    /// [`State::process_incoming`]: crate::State::process_incoming
+    /// [`Event`]: crate::Event
+    pub fn event<Req: RequestExt + Send + Sync + 'static>(req: Req) -> Self {
+        Self::new(req, None::<fn(ResponseResult<Req::Response>)>)
     }
 
-    fn satisfy_error(self, raw_error: serde_json::Value) -> Option<ErroredRequest> {
-        (*self).satisfy_error(raw_error)
+    /// Returns the method name and parameters for this request.
+    ///
+    /// Used to serialize the request into a JSON-RPC message and to reconstruct
+    /// [`RawRequest`]s for pending requests.
+    ///
+    /// [`RawRequest`]: crate::RawRequest
+    pub fn to_method_and_params(&self) -> MethodAndParams {
+        self.method_and_params.clone()
+    }
+
+    /// Handles the raw server result by invoking the type-erased handler closure.
+    ///
+    /// Returns `Ok(Some(Event))` for event-style requests, `Ok(None)` for callback-dispatched
+    /// requests, or `Err` if deserialization failed.
+    pub fn handle(self, result: Result<Value, Value>) -> Result<Option<Event>, serde_json::Error> {
+        (self.handler)(result)
+    }
+}
+
+impl std::fmt::Debug for PendingRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingRequest")
+            .field("method_and_params", &self.method_and_params)
+            .finish_non_exhaustive()
     }
 }

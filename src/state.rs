@@ -59,17 +59,17 @@ impl Event {
 /// state as needed and may return an [`Event`] representing a notification or a response to a
 /// previously tracked request.
 #[derive(Debug)]
-pub struct State<PReq: PendingRequest> {
-    pending: HashMap<u32, PReq>,
+pub struct State {
+    pending: HashMap<u32, PendingRequest>,
 }
 
-impl<PReq: PendingRequest> Default for State<PReq> {
+impl Default for State {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<PReq: PendingRequest> State<PReq> {
+impl State {
     /// Creates a new [`State`] instance.
     pub fn new() -> Self {
         Self {
@@ -104,13 +104,9 @@ impl<PReq: PendingRequest> State<PReq> {
     /// batch.
     pub fn track_request<R>(&mut self, next_id: &mut u32, req: R) -> MaybeBatch<RawRequest>
     where
-        R: Into<MaybeBatch<PReq>>,
+        R: Into<MaybeBatch<PendingRequest>>,
     {
-        fn _add_request<PReq: PendingRequest>(
-            state: &mut State<PReq>,
-            next_id: &mut u32,
-            req: PReq,
-        ) -> RawRequest {
+        fn _add_request(state: &mut State, next_id: &mut u32, req: PendingRequest) -> RawRequest {
             let id = *next_id;
             *next_id = id.wrapping_add(1);
             let (method, params) = req.to_method_and_params();
@@ -156,13 +152,9 @@ impl<PReq: PendingRequest> State<PReq> {
                     .pending
                     .remove(&resp.id)
                     .ok_or(ProcessError::MissingRequest(resp.id))?;
-                Ok(match resp.result {
-                    Ok(raw_resp) => pending_req
-                        .satisfy(raw_resp)
-                        .map_err(|de_err| ProcessError::CannotDeserializeResponse(resp.id, de_err))?
-                        .map(Event::Response),
-                    Err(raw_err) => pending_req.satisfy_error(raw_err).map(Event::ResponseError),
-                })
+                pending_req
+                    .handle(resp.result)
+                    .map_err(|de_err| ProcessError::CannotDeserializeResponse(resp.id, de_err))
             }
         }
     }

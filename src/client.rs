@@ -1,3 +1,4 @@
+use crate::pending_request::{PendingRequest, RequestExt};
 use crate::*;
 
 /// An asynchronous Electrum client built on the [`futures`] I/O ecosystem.
@@ -63,11 +64,11 @@ impl AsyncClient {
     {
         use futures::{channel::mpsc, StreamExt};
         let (event_tx, event_recv) = mpsc::unbounded::<Event>();
-        let (req_tx, mut req_recv) = mpsc::unbounded::<MaybeBatch<AsyncPendingRequest>>();
+        let (req_tx, mut req_recv) = mpsc::unbounded::<MaybeBatch<PendingRequest>>();
 
         let mut incoming_stream =
             crate::io::ReadStreamer::new(futures::io::BufReader::new(reader)).fuse();
-        let mut state = State::<AsyncPendingRequest>::new();
+        let mut state = State::new();
         let mut next_id = 0_u32;
 
         let fut = async move {
@@ -151,18 +152,16 @@ impl AsyncClient {
     /// [`AsyncRequestError::Canceled`].
     pub async fn send_request<Req>(&self, req: Req) -> Result<Req::Response, AsyncRequestError>
     where
-        Req: Request,
-        AsyncPendingRequestTuple<Req, Req::Response>: Into<AsyncPendingRequest>,
+        Req: RequestExt + Send + Sync + 'static,
+        Req::Response: Send,
     {
-        use futures::TryFutureExt;
-        let mut batch = AsyncBatchRequest::new();
-        let resp_fut = batch.request(req).map_err(|e| match e {
-            BatchRequestError::Canceled => AsyncRequestError::Canceled,
-            BatchRequestError::Response(e) => AsyncRequestError::Response(e),
-        });
+        let mut batch = BatchRequest::new();
+        let rx = batch.request_async(req);
         self.send_batch(batch)
             .map_err(AsyncRequestError::Dispatch)?;
-        resp_fut.await
+        rx.await
+            .map_err(|_| AsyncRequestError::Canceled)?
+            .map_err(AsyncRequestError::Response)
     }
 
     /// Sends a request that is expected to result in an event-based response (e.g., a
@@ -184,10 +183,9 @@ impl AsyncClient {
     /// [`AsyncRequestSendError`]: crate::AsyncRequestSendError
     pub fn send_event_request<Req>(&self, request: Req) -> Result<(), AsyncRequestSendError>
     where
-        Req: Request,
-        AsyncPendingRequestTuple<Req, Req::Response>: Into<AsyncPendingRequest>,
+        Req: RequestExt + Send + Sync + 'static,
     {
-        let mut batch = AsyncBatchRequest::new();
+        let mut batch = BatchRequest::new();
         batch.event_request(request);
         self.send_batch(batch)?;
         Ok(())
@@ -195,33 +193,24 @@ impl AsyncClient {
 
     /// Sends a batch of requests to the Electrum server.
     ///
-    /// The batch is constructed using [`AsyncBatchRequest`], which allows queuing both tracked
-    /// requests (via [`AsyncBatchRequest::request`]) and event-style requests (via
-    /// [`AsyncBatchRequest::event_request`]).
+    /// The batch is constructed using [`BatchRequest`], which allows queuing both tracked
+    /// requests (via [`BatchRequest::request`]) and event-style requests (via
+    /// [`BatchRequest::event_request`]).
     ///
-    /// Tracked requests return futures that resolve to the server’s response. Event-style requests
-    /// (e.g., subscriptions) do produce an initial server response, but it is delivered through the
-    /// [`AsyncEventReceiver`] and not through a dedicated future.
-    ///
-    /// **Important:** Do not `.await` any futures returned by [`AsyncBatchRequest::request`] until
-    /// *after* the batch has been submitted via `send_batch`. Awaiting too early will block
-    /// forever, as the requests haven’t been assigned IDs or sent yet.
-    ///
-    /// This method does not await any responses itself. Responses and notifications will be
-    /// delivered asynchronously via the [`AsyncEventReceiver`] or via the [`Future`]s returned by
-    /// [`AsyncBatchRequest::request`] — assuming they are awaited at the correct time.
+    /// Tracked requests use callbacks that are invoked when the server responds. Event-style
+    /// requests (e.g., subscriptions) produce an initial server response delivered through the
+    /// [`AsyncEventReceiver`].
     ///
     /// # Returns
     /// - `Ok(true)` if the batch was non-empty and sent successfully.
     /// - `Ok(false)` if the batch was empty and nothing was sent.
     /// - `Err` if the batch could not be sent (e.g., if the client was shut down).
     ///
-    /// [`Future`]: futures::Future
-    /// [`AsyncBatchRequest`]: crate::AsyncBatchRequest
-    /// [`AsyncBatchRequest::request`]: crate::AsyncBatchRequest::request
-    /// [`AsyncBatchRequest::event_request`]: crate::AsyncBatchRequest::event_request
+    /// [`BatchRequest`]: crate::BatchRequest
+    /// [`BatchRequest::request`]: crate::BatchRequest::request
+    /// [`BatchRequest::event_request`]: crate::BatchRequest::event_request
     /// [`AsyncEventReceiver`]: crate::AsyncEventReceiver
-    pub fn send_batch(&self, batch_req: AsyncBatchRequest) -> Result<bool, AsyncRequestSendError> {
+    pub fn send_batch(&self, batch_req: BatchRequest) -> Result<bool, AsyncRequestSendError> {
         match batch_req.into_inner() {
             Some(batch) => self.tx.unbounded_send(batch).map(|_| true),
             None => Ok(false),
@@ -286,10 +275,9 @@ impl BlockingClient {
     {
         use std::sync::mpsc::*;
         let (event_tx, event_recv) = channel::<Event>();
-        let (req_tx, req_recv) = channel::<MaybeBatch<BlockingPendingRequest>>();
+        let (req_tx, req_recv) = channel::<MaybeBatch<PendingRequest>>();
         let incoming_stream = crate::io::ReadStreamer::new(std::io::BufReader::new(reader));
-        let read_state =
-            std::sync::Arc::new(std::sync::Mutex::new(State::<BlockingPendingRequest>::new()));
+        let read_state = std::sync::Arc::new(std::sync::Mutex::new(State::new()));
         let write_state = std::sync::Arc::clone(&read_state);
 
         let read_join = std::thread::spawn(move || -> std::io::Result<()> {
@@ -332,15 +320,14 @@ impl BlockingClient {
     /// [`BlockingRequestError`]: crate::BlockingRequestError
     pub fn send_request<Req>(&self, req: Req) -> Result<Req::Response, BlockingRequestError>
     where
-        Req: Request,
-        BlockingPendingRequestTuple<Req, Req::Response>: Into<BlockingPendingRequest>,
+        Req: RequestExt + Send + Sync + 'static,
+        Req::Response: Send,
     {
-        let mut batch = BlockingBatchRequest::new();
-        let resp_rx = batch.request(req);
+        let mut batch = BatchRequest::new();
+        let rx = batch.request_blocking(req);
         self.send_batch(batch)
             .map_err(BlockingRequestError::Dispatch)?;
-        resp_rx
-            .recv()
+        rx.recv()
             .map_err(|_| BlockingRequestError::Canceled)?
             .map_err(BlockingRequestError::Response)
     }
@@ -364,10 +351,9 @@ impl BlockingClient {
     /// [`BlockingRequestSendError`]: crate::BlockingRequestSendError
     pub fn send_event_request<Req>(&self, request: Req) -> Result<(), BlockingRequestSendError>
     where
-        Req: Request,
-        BlockingPendingRequestTuple<Req, Req::Response>: Into<BlockingPendingRequest>,
+        Req: RequestExt + Send + Sync + 'static,
     {
-        let mut batch = BlockingBatchRequest::new();
+        let mut batch = BatchRequest::new();
         batch.event_request(request);
         self.send_batch(batch)?;
         Ok(())
@@ -375,31 +361,24 @@ impl BlockingClient {
 
     /// Sends a batch of requests to the Electrum server.
     ///
-    /// The batch is constructed using [`BlockingBatchRequest`], which allows queuing both tracked
-    /// requests (via [`BlockingBatchRequest::request`]) and event-style requests (via
-    /// [`BlockingBatchRequest::event_request`]).
+    /// The batch is constructed using [`BatchRequest`], which allows queuing both tracked
+    /// requests (via [`BatchRequest::request`]) and event-style requests (via
+    /// [`BatchRequest::event_request`]).
     ///
-    /// Tracked requests return blocking handles that can be used to wait for server responses.
-    /// Event-style requests (e.g., subscriptions) still result in a server response, but it is
-    /// emitted through the [`BlockingEventReceiver`] instead of through a blocking response handle.
-    ///
-    /// **Important:** Do not call `.recv()` or `.wait()` on any response handles returned by
-    /// [`BlockingBatchRequest::request`] until after the batch has been submitted using
-    /// `send_batch`. Doing so will block indefinitely, as the request has not yet been sent.
+    /// Tracked requests use callbacks that are invoked when the server responds. Event-style
+    /// requests (e.g., subscriptions) produce an initial server response delivered through the
+    /// [`BlockingEventReceiver`].
     ///
     /// # Returns
     /// - `Ok(true)` if the batch was non-empty and sent successfully.
     /// - `Ok(false)` if the batch was empty and nothing was sent.
     /// - `Err` if the batch could not be sent (e.g., if the client was shut down).
     ///
-    /// [`BlockingBatchRequest`]: crate::BlockingBatchRequest
-    /// [`BlockingBatchRequest::request`]: crate::BlockingBatchRequest::request
-    /// [`BlockingBatchRequest::event_request`]: crate::BlockingBatchRequest::event_request
+    /// [`BatchRequest`]: crate::BatchRequest
+    /// [`BatchRequest::request`]: crate::BatchRequest::request
+    /// [`BatchRequest::event_request`]: crate::BatchRequest::event_request
     /// [`BlockingEventReceiver`]: crate::BlockingEventReceiver
-    pub fn send_batch(
-        &self,
-        batch_req: BlockingBatchRequest,
-    ) -> Result<bool, BlockingRequestSendError> {
+    pub fn send_batch(&self, batch_req: BatchRequest) -> Result<bool, BlockingRequestSendError> {
         match batch_req.into_inner() {
             Some(batch) => self.tx.send(batch).map(|_| true),
             None => Ok(false),
