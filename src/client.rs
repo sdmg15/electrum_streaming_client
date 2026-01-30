@@ -64,11 +64,11 @@ impl AsyncClient {
     {
         use futures::{channel::mpsc, StreamExt};
         let (event_tx, event_recv) = mpsc::unbounded::<Event>();
-        let (req_tx, mut req_recv) = mpsc::unbounded::<MaybeBatch<PendingRequest>>();
+        let (req_tx, mut req_recv) = mpsc::unbounded::<RawOneOrMany<PendingRequest>>();
 
         let mut incoming_stream =
             crate::io::ReadStreamer::new(futures::io::BufReader::new(reader)).fuse();
-        let mut state = State::new();
+        let mut state = RequestTracker::new();
         let mut next_id = 0_u32;
 
         let fut = async move {
@@ -84,7 +84,7 @@ impl AsyncClient {
                     incoming_opt = incoming_stream.next() => match incoming_opt {
                         Some(incoming_res) => {
                             let event_opt = state
-                                .process_incoming(incoming_res?)
+                                .handle_incoming(incoming_res?)
                                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
                             if let Some(event) = event_opt {
                                 if let Err(_err) = event_tx.unbounded_send(event) {
@@ -275,9 +275,9 @@ impl BlockingClient {
     {
         use std::sync::mpsc::*;
         let (event_tx, event_recv) = channel::<Event>();
-        let (req_tx, req_recv) = channel::<MaybeBatch<PendingRequest>>();
+        let (req_tx, req_recv) = channel::<RawOneOrMany<PendingRequest>>();
         let incoming_stream = crate::io::ReadStreamer::new(std::io::BufReader::new(reader));
-        let read_state = std::sync::Arc::new(std::sync::Mutex::new(State::new()));
+        let read_state = std::sync::Arc::new(std::sync::Mutex::new(RequestTracker::new()));
         let write_state = std::sync::Arc::clone(&read_state);
 
         let read_join = std::thread::spawn(move || -> std::io::Result<()> {
@@ -285,7 +285,7 @@ impl BlockingClient {
                 let event_opt = read_state
                     .lock()
                     .unwrap()
-                    .process_incoming(incoming_res?)
+                    .handle_incoming(incoming_res?)
                     .map_err(|error| std::io::Error::new(std::io::ErrorKind::Other, error))?;
                 if let Some(event) = event_opt {
                     if let Err(_err) = event_tx.send(event) {

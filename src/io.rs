@@ -9,18 +9,18 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::{MaybeBatch, RawNotificationOrResponse, RawRequest};
+use crate::{RawIncoming, RawOneOrMany, RawRequest};
 
 /// A streaming parser for Electrum JSON-RPC messages from an input reader.
 ///
 /// `ReadStreamer` incrementally reads from a source implementing [`std::io::BufRead`] or
 /// [`futures::io::AsyncBufRead`] (depending on the API used), parses incoming JSON-RPC payloads, and
-/// queues deserialized [`RawNotificationOrResponse`] items for consumption.
+/// queues deserialized [`RawIncoming`] items for consumption.
 ///
 /// ### Behavior
 ///
 /// - For **blocking transports**, `ReadStreamer` implements [`Iterator`], yielding one
-///   [`RawNotificationOrResponse`] at a time.
+///   [`RawIncoming`] at a time.
 /// - For **async transports**, `ReadStreamer` implements [`futures::Stream`], with the same item
 ///   type.
 ///
@@ -63,7 +63,7 @@ use crate::{MaybeBatch, RawNotificationOrResponse, RawRequest};
 pub struct ReadStreamer<R> {
     reader: Option<R>,
     buf: Vec<u8>,
-    queue: VecDeque<RawNotificationOrResponse>,
+    queue: VecDeque<RawIncoming>,
     err: Option<std::io::Error>,
 }
 
@@ -86,9 +86,9 @@ impl<R> ReadStreamer<R> {
             Some(b) => assert_eq!(b, b'\n'),
             None => return false,
         }
-        match serde_json::from_slice::<MaybeBatch<RawNotificationOrResponse>>(&self.buf) {
-            Ok(MaybeBatch::Single(t)) => self.queue.push_back(t),
-            Ok(MaybeBatch::Batch(v)) => self.queue.extend(v),
+        match serde_json::from_slice::<RawOneOrMany<RawIncoming>>(&self.buf) {
+            Ok(RawOneOrMany::Single(t)) => self.queue.push_back(t),
+            Ok(RawOneOrMany::Batch(v)) => self.queue.extend(v),
             Err(err) => {
                 self.err = Some(err.into());
                 return false;
@@ -100,7 +100,7 @@ impl<R> ReadStreamer<R> {
 }
 
 impl<R: std::io::BufRead> Iterator for ReadStreamer<R> {
-    type Item = std::io::Result<RawNotificationOrResponse>;
+    type Item = std::io::Result<RawIncoming>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -123,7 +123,7 @@ impl<R: std::io::BufRead> Iterator for ReadStreamer<R> {
 }
 
 impl<R: futures::AsyncBufRead + Unpin> futures::Stream for ReadStreamer<R> {
-    type Item = std::io::Result<RawNotificationOrResponse>;
+    type Item = std::io::Result<RawIncoming>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         use futures::AsyncBufReadExt;
@@ -173,7 +173,7 @@ impl<R: futures::AsyncBufRead + Unpin> futures::Stream for ReadStreamer<R> {
 /// Returns a [`std::io::Error`] if the write operation fails.
 pub fn blocking_write<W, T>(mut writer: W, msg: T) -> std::io::Result<()>
 where
-    T: Into<MaybeBatch<RawRequest>>,
+    T: Into<RawOneOrMany<RawRequest>>,
     W: std::io::Write,
 {
     let mut b = serde_json::to_vec(&msg.into()).expect("must serialize");
@@ -194,7 +194,7 @@ where
 /// Returns a [`std::io::Error`] if the async write operation fails.
 pub async fn async_write<W, T>(mut writer: W, msg: T) -> std::io::Result<()>
 where
-    T: Into<MaybeBatch<RawRequest>>,
+    T: Into<RawOneOrMany<RawRequest>>,
     W: futures::AsyncWrite + Unpin,
 {
     use futures::AsyncWriteExt;
@@ -209,7 +209,7 @@ where
 #[cfg(feature = "tokio")]
 pub async fn tokio_write<W, T>(mut writer: W, msg: T) -> std::io::Result<()>
 where
-    T: Into<MaybeBatch<RawRequest>>,
+    T: Into<RawOneOrMany<RawRequest>>,
     W: tokio::io::AsyncWrite + Unpin,
 {
     use tokio::io::AsyncWriteExt;

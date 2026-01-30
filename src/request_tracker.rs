@@ -1,7 +1,7 @@
 use crate::*;
 use bitcoin::block::Header;
 use notification::Notification;
-use pending_request::{ErroredRequest, PendingRequest, SatisfiedRequest};
+use pending_request::{CompletedRequest, FailedRequest, PendingRequest};
 use std::collections::HashMap;
 
 /// Represents a high-level event produced after processing a server notification or response.
@@ -10,12 +10,12 @@ pub enum Event {
     /// A successfully satisfied response to a previously tracked request.
     ///
     /// Contains the original request and the parsed result.
-    Response(SatisfiedRequest),
+    Response(CompletedRequest),
 
     /// A failed response to a previously tracked request.
     ///
     /// Contains the original request and the error returned by the server.
-    ResponseError(ErroredRequest),
+    ResponseError(FailedRequest),
 
     /// A server-initiated notification that was not in response to any tracked request.
     ///
@@ -33,13 +33,13 @@ impl Event {
     /// Returns `None` if the event does not include any header information.
     pub fn try_to_headers(&self) -> Option<Vec<(u32, Header)>> {
         match self {
-            Event::Response(SatisfiedRequest::Header { req, resp }) => {
+            Event::Response(CompletedRequest::Header { req, resp }) => {
                 Some(vec![(req.height, resp.header)])
             }
-            Event::Response(SatisfiedRequest::Headers { req, resp }) => {
+            Event::Response(CompletedRequest::Headers { req, resp }) => {
                 Some((req.start_height..).zip(resp.headers.clone()).collect())
             }
-            Event::Response(SatisfiedRequest::HeadersWithCheckpoint { req, resp }) => {
+            Event::Response(CompletedRequest::HeadersWithCheckpoint { req, resp }) => {
                 Some((req.start_height..).zip(resp.headers.clone()).collect())
             }
             Event::Notification(Notification::Header(n)) => Some(vec![(n.height(), *n.header())]),
@@ -50,27 +50,27 @@ impl Event {
 
 /// A sans-io structure that manages the state of an Electrum client.
 ///
-/// The [`State`] tracks outgoing requests and handles incoming messages from the Electrum server.
+/// The [`RequestTracker`] tracks outgoing requests and handles incoming messages from the Electrum server.
 ///
-/// Use [`State::track_request`] to register a new request. This method stores the request
+/// Use [`RequestTracker::track_request`] to register a new request. This method stores the request
 /// internally and returns a [`RawRequest`] that can be sent to the server.
 ///
-/// Use [`State::process_incoming`] to handle messages received from the server. It updates internal
+/// Use [`RequestTracker::handle_incoming`] to handle messages received from the server. It updates internal
 /// state as needed and may return an [`Event`] representing a notification or a response to a
 /// previously tracked request.
 #[derive(Debug)]
-pub struct State {
+pub struct RequestTracker {
     pending: HashMap<u32, PendingRequest>,
 }
 
-impl Default for State {
+impl Default for RequestTracker {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl State {
-    /// Creates a new [`State`] instance.
+impl RequestTracker {
+    /// Creates a new [`RequestTracker`] instance.
     pub fn new() -> Self {
         Self {
             pending: HashMap::new(),
@@ -83,7 +83,7 @@ impl State {
     }
 
     /// Returns an iterator over all pending requests that have been registered with
-    /// [`State::track_request`] but have not yet received a response.
+    /// [`RequestTracker::track_request`] but have not yet received a response.
     ///
     /// Each item in the iterator is a [`RawRequest`] containing the request ID, method name,
     /// and parameters, which can be serialized and sent to the Electrum server.
@@ -98,24 +98,28 @@ impl State {
     /// or batch of [`RawRequest`]s to be sent to the Electrum server.
     ///
     /// Each request is assigned a unique ID (via `next_id`) and stored internally until a matching
-    /// response is received via [`State::process_incoming`].
+    /// response is received via [`RequestTracker::handle_incoming`].
     ///
-    /// Returns a [`MaybeBatch<RawRequest>`], preserving whether the input was a single request or a
+    /// Returns a [`RawOneOrMany<RawRequest>`], preserving whether the input was a single request or a
     /// batch.
-    pub fn track_request<R>(&mut self, next_id: &mut u32, req: R) -> MaybeBatch<RawRequest>
+    pub fn track_request<R>(&mut self, next_id: &mut u32, req: R) -> RawOneOrMany<RawRequest>
     where
-        R: Into<MaybeBatch<PendingRequest>>,
+        R: Into<RawOneOrMany<PendingRequest>>,
     {
-        fn _add_request(state: &mut State, next_id: &mut u32, req: PendingRequest) -> RawRequest {
+        fn _add_request(
+            tracker: &mut RequestTracker,
+            next_id: &mut u32,
+            req: PendingRequest,
+        ) -> RawRequest {
             let id = *next_id;
             *next_id = id.wrapping_add(1);
             let (method, params) = req.to_method_and_params();
-            state.pending.insert(id, req);
+            tracker.pending.insert(id, req);
             RawRequest::new(id, method, params)
         }
         match req.into() {
-            MaybeBatch::Single(req) => _add_request(self, next_id, req).into(),
-            MaybeBatch::Batch(v) => v
+            RawOneOrMany::Single(req) => _add_request(self, next_id, req).into(),
+            RawOneOrMany::Batch(v) => v
                 .into_iter()
                 .map(|req| _add_request(self, next_id, req))
                 .collect::<Vec<_>>()
@@ -132,12 +136,12 @@ impl State {
     ///
     /// Returns `Ok(Some(Event))` if an event was produced, `Ok(None)` if no event was needed, or
     /// `Err(ProcessError)` if the input could not be parsed or did not match any known request.
-    pub fn process_incoming(
+    pub fn handle_incoming(
         &mut self,
-        notification_or_response: RawNotificationOrResponse,
+        incoming: RawIncoming,
     ) -> Result<Option<Event>, ProcessError> {
-        match notification_or_response {
-            RawNotificationOrResponse::Notification(raw) => {
+        match incoming {
+            RawIncoming::Notification(raw) => {
                 let notification = Notification::new(&raw).map_err(|error| {
                     ProcessError::CannotDeserializeNotification {
                         method: raw.method,
@@ -147,7 +151,7 @@ impl State {
                 })?;
                 Ok(Some(Event::Notification(notification)))
             }
-            RawNotificationOrResponse::Response(resp) => {
+            RawIncoming::Response(resp) => {
                 let pending_req = self
                     .pending
                     .remove(&resp.id)
