@@ -1,6 +1,44 @@
 use crate::pending_request::{PendingRequest, RequestExt};
 use crate::*;
 
+// --- Async client type aliases ---
+
+/// The sending half of the channel used to enqueue one or more requests from [`AsyncClient`].
+///
+/// These requests are processed and forwarded to [`RequestTracker::track_request`] to be assigned an ID and serialized.
+pub type AsyncRequestSender = futures::channel::mpsc::UnboundedSender<RawOneOrMany<PendingRequest>>;
+
+/// The error returned by [`AsyncClient::send_request`] when a request fails.
+///
+/// This may occur if the server responds with an error, the request is canceled, or the client is shut down.
+pub type AsyncRequestError = crate::request::Error<AsyncRequestSendError>;
+
+/// The error that occurs when a request cannot be sent into the async request channel.
+///
+/// This typically means the client's background task has shut down or the queue is disconnected.
+pub type AsyncRequestSendError = futures::channel::mpsc::TrySendError<RawOneOrMany<PendingRequest>>;
+
+/// The receiving half of the internal event stream, returned to users of [`AsyncClient`].
+///
+/// This yields all incoming [`Event`]s from the Electrum server, including notifications and responses.
+pub type AsyncEventReceiver = futures::channel::mpsc::UnboundedReceiver<Event>;
+
+// --- Blocking client type aliases ---
+
+/// Channel sender for sending blocking requests from [`BlockingClient`] to the write thread.
+pub type BlockingRequestSender = std::sync::mpsc::Sender<RawOneOrMany<PendingRequest>>;
+
+/// Error returned by [`BlockingClient::send_request`] if the request fails or is canceled.
+pub type BlockingRequestError = crate::request::Error<BlockingRequestSendError>;
+
+/// Error that occurs when a blocking request cannot be sent to the internal request channel.
+///
+/// Typically indicates that the client has been shut down.
+pub type BlockingRequestSendError = std::sync::mpsc::SendError<RawOneOrMany<PendingRequest>>;
+
+/// Channel receiver used to receive [`Event`]s from the Electrum server.
+pub type BlockingEventReceiver = std::sync::mpsc::Receiver<Event>;
+
 /// An asynchronous Electrum client built on the [`futures`] I/O ecosystem.
 ///
 /// This client allows sending JSON-RPC requests and receiving [`Event`]s from an Electrum server
@@ -21,7 +59,7 @@ use crate::*;
 /// [`Event`]: crate::Event
 /// [`AsyncBufRead`]: futures::io::AsyncBufRead
 /// [`AsyncWrite`]: futures::io::AsyncWrite
-/// [`AsyncEventReceiver`]: crate::AsyncEventReceiver
+/// [`AsyncEventReceiver`]: crate::client::AsyncEventReceiver
 #[derive(Debug, Clone)]
 pub struct AsyncClient {
     tx: AsyncRequestSender,
@@ -48,7 +86,7 @@ impl AsyncClient {
     /// - A `Future`: the client worker loop. This must be polled (e.g., via `tokio::spawn`)
     ///   to drive the connection.
     ///
-    /// [`AsyncEventReceiver`]: crate::AsyncEventReceiver
+    /// [`AsyncEventReceiver`]: crate::client::AsyncEventReceiver
     /// [`Event`]: crate::Event
     pub fn new<R, W>(
         reader: R,
@@ -116,7 +154,7 @@ impl AsyncClient {
     /// - A `Future`: the client worker loop. This must be spawned or polled to keep the client
     ///   alive.
     ///
-    /// [`AsyncEventReceiver`]: crate::AsyncEventReceiver
+    /// [`AsyncEventReceiver`]: crate::client::AsyncEventReceiver
     /// [`Event`]: crate::Event
     /// [`AsyncClient::new`]: crate::AsyncClient::new
     #[cfg(feature = "tokio")]
@@ -179,7 +217,7 @@ impl AsyncClient {
     ///
     /// [`send_request`]: Self::send_request
     /// [`Event`]: crate::Event
-    /// [`AsyncEventReceiver`]: crate::AsyncEventReceiver
+    /// [`AsyncEventReceiver`]: crate::client::AsyncEventReceiver
     /// [`AsyncRequestSendError`]: crate::AsyncRequestSendError
     pub fn send_event_request<Req>(&self, request: Req) -> Result<(), AsyncRequestSendError>
     where
@@ -209,7 +247,7 @@ impl AsyncClient {
     /// [`BatchRequest`]: crate::BatchRequest
     /// [`BatchRequest::request`]: crate::BatchRequest::request
     /// [`BatchRequest::event_request`]: crate::BatchRequest::event_request
-    /// [`AsyncEventReceiver`]: crate::AsyncEventReceiver
+    /// [`AsyncEventReceiver`]: crate::client::AsyncEventReceiver
     pub fn send_batch(&self, batch_req: BatchRequest) -> Result<bool, AsyncRequestSendError> {
         match batch_req.into_inner() {
             Some(batch) => self.tx.unbounded_send(batch).map(|_| true),
@@ -229,7 +267,7 @@ impl AsyncClient {
 /// Use the associated [`BlockingEventReceiver`] to receive [`Event`]s emitted by the server.
 ///
 /// [`Event`]: crate::Event
-/// [`BlockingEventReceiver`]: crate::BlockingEventReceiver
+/// [`BlockingEventReceiver`]: crate::client::BlockingEventReceiver
 #[derive(Debug, Clone)]
 pub struct BlockingClient {
     tx: BlockingRequestSender,
@@ -258,7 +296,7 @@ impl BlockingClient {
     ///   used to monitor or explicitly join the background threads if desired.
     ///
     /// [`Event`]: crate::Event
-    /// [`BlockingEventReceiver`]: crate::BlockingEventReceiver
+    /// [`BlockingEventReceiver`]: crate::client::BlockingEventReceiver
     /// [`JoinHandle`]: std::thread::JoinHandle
     pub fn new<R, W>(
         reader: R,
@@ -347,7 +385,7 @@ impl BlockingClient {
     /// Returns [`BlockingRequestSendError`] if the request could not be queued for sending.
     ///
     /// [`Event`]: crate::Event
-    /// [`BlockingEventReceiver`]: crate::BlockingEventReceiver
+    /// [`BlockingEventReceiver`]: crate::client::BlockingEventReceiver
     /// [`BlockingRequestSendError`]: crate::BlockingRequestSendError
     pub fn send_event_request<Req>(&self, request: Req) -> Result<(), BlockingRequestSendError>
     where
@@ -377,7 +415,7 @@ impl BlockingClient {
     /// [`BatchRequest`]: crate::BatchRequest
     /// [`BatchRequest::request`]: crate::BatchRequest::request
     /// [`BatchRequest::event_request`]: crate::BatchRequest::event_request
-    /// [`BlockingEventReceiver`]: crate::BlockingEventReceiver
+    /// [`BlockingEventReceiver`]: crate::client::BlockingEventReceiver
     pub fn send_batch(&self, batch_req: BatchRequest) -> Result<bool, BlockingRequestSendError> {
         match batch_req.into_inner() {
             Some(batch) => self.tx.send(batch).map(|_| true),
