@@ -4,7 +4,7 @@ use async_std::{net::TcpStream, stream::StreamExt};
 use bdk_testenv::{anyhow, bitcoincore_rpc::RpcApi, TestEnv};
 use bitcoin::Amount;
 use electrum_streaming_client::{
-    notification::Notification, request, AsyncClient, Event, SatisfiedRequest,
+    notification::Notification, request, AsyncClient, CompletedRequest, Event,
 };
 use futures::{
     executor::{block_on, ThreadPool},
@@ -36,12 +36,12 @@ fn synopsis() -> anyhow::Result<()> {
         ))?;
         assert!(matches!(
             event_rx.next().await,
-            Some(Event::Response(SatisfiedRequest::HeadersSubscribe { .. }))
+            Some(Event::Response(CompletedRequest::HeadersSubscribe { .. }))
         ));
         assert!(matches!(
             event_rx.next().await,
             Some(Event::Response(
-                SatisfiedRequest::ScriptHashSubscribe { .. }
+                CompletedRequest::ScriptHashSubscribe { .. }
             ))
         ));
 

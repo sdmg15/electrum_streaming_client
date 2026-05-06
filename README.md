@@ -10,13 +10,13 @@ models.
 
 - **Streaming protocol support**: Handles both server-initiated notifications and responses.
 - **Transport agnostic**: Works with any I/O type implementing the appropriate `Read`/`Write` traits.
-- **Sans-IO core**: The [`State`] struct tracks pending requests and processes server messages.
+- **Sans-IO core**: The [`RequestTracker`] struct tracks pending requests and handles incoming server messages.
 - **Typed request/response system**: Strongly typed Electrum method wrappers with minimal overhead.
 
 ## Example (async with Tokio)
 
 ```rust,no_run
-use electrum_streaming_client::{AsyncClient, AsyncBatchRequest, Event};
+use electrum_streaming_client::{AsyncClient, Event};
 use tokio::net::TcpStream;
 use futures::StreamExt;
 
@@ -28,11 +28,7 @@ async fn main() -> anyhow::Result<()> {
 
     tokio::spawn(worker); // spawn the client worker task
 
-    let mut batch = AsyncBatchRequest::new();
-    let fut = batch.request(electrum_streaming_client::request::RelayFee);
-    client.send_batch(batch)?;
-    let relay_fee = fut.await?;
-
+    let relay_fee = client.send_request(electrum_streaming_client::request::RelayFee).await?;
     println!("Relay fee: {relay_fee:?}");
 
     while let Some(event) = events.next().await {
