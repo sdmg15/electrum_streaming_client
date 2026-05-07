@@ -656,3 +656,93 @@ impl Request for Ping {
         ("server.ping".into(), vec![])
     }
 }
+
+/// A request to establish connection with Frigate Electrum client
+///
+/// This corresponds to the `"server.version"` Frigate Electrum RPC method
+///
+/// See: https://github.com/sparrowwallet/frigate
+#[cfg(feature = "frigate")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Version {
+    pub client_name: CowStr,
+    pub version: CowStr,
+}
+
+#[cfg(feature = "frigate")]
+impl Request for Version {
+    type Response = Vec<String>;
+
+    fn to_method_and_params(&self) -> MethodAndParams {
+        (
+            "server.version".into(),
+            vec![self.client_name.clone().into(), self.version.clone().into()],
+        )
+    }
+}
+
+/// A request to subscribe to payment outputs belonging to the provided keys
+///
+/// This corresponds to the `"blockchain.silentpayments.subscribe"` Frigate Electrum RPC method.
+/// It returns The silent payment address that has been subscribed.
+///
+/// See: https://github.com/sparrowwallet/frigate#blockchainsilentpaymentssubscribe
+#[cfg(feature = "frigate")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpSubscribe {
+    pub scan_priv_key: bitcoin::secp256k1::SecretKey,
+    pub scan_pub_key: bitcoin::secp256k1::PublicKey,
+    pub start_height: Option<u32>,
+    pub labels: Option<Vec<u32>>,
+}
+
+#[cfg(feature = "frigate")]
+impl Request for SpSubscribe {
+    type Response = String;
+
+    fn to_method_and_params(&self) -> MethodAndParams {
+        let mut params = vec![
+            serde_json::json!(self.scan_priv_key),
+            serde_json::json!(self.scan_pub_key),
+        ];
+
+        if let Some(start_height) = self.start_height {
+            params.push(start_height.into());
+        }
+
+        if let Some(labels) = &self.labels {
+            params.push(labels.clone().into());
+        }
+
+        ("blockchain.silentpayments.subscribe".into(), params)
+    }
+}
+
+/// A request to unsubscribe to payment outputs belonging to the provided keys
+///
+/// This corresponds to the `"blockchain.silentpayments.unsubscribe"` Frigate Electrum RPC method.
+/// It returns The silent payment address that has been subscribed.This should cancel any scans that
+/// may be currently running for this address.
+///
+/// See: https://github.com/sparrowwallet/frigate#blockchainsilentpaymentsunsubscribe
+#[cfg(feature = "frigate")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpUnSubscribe {
+    pub scan_priv_key: bitcoin::secp256k1::SecretKey,
+    pub scan_pub_key: bitcoin::secp256k1::PublicKey,
+}
+
+#[cfg(feature = "frigate")]
+impl Request for SpUnSubscribe {
+    type Response = String;
+
+    fn to_method_and_params(&self) -> MethodAndParams {
+        (
+            "blockchain.silentpayments.unsubscribe".into(),
+            vec![
+                serde_json::json!(self.scan_priv_key),
+                serde_json::json!(self.scan_pub_key),
+            ],
+        )
+    }
+}

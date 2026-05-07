@@ -5,6 +5,7 @@
 //!
 //! - [`Notification::Header`] for `"blockchain.headers.subscribe"`
 //! - [`Notification::ScriptHash`] for `"blockchain.scripthash.subscribe"`
+//! - [`Notification::SpSubscribe`] for `"blockchain.silentpayments.subscribe"`
 //! - [`Notification::Unknown`] for unrecognized or unsupported methods
 //!
 //! Each variant wraps a struct that contains the deserialized payload for that notification type.
@@ -32,6 +33,11 @@ pub enum Notification {
     /// status.
     ScriptHash(ScriptHashNotification),
 
+    /// A notification from `"blockchain.silentpayments.subscribe"` indicating a new history
+    /// of transactions
+    #[cfg(feature = "frigate")]
+    SpSubscribe(SpNotification),
+
     /// A catch-all for notifications with unrecognized methods.
     ///
     /// The original [`RawNotification`] is preserved for downstream inspection.
@@ -51,6 +57,10 @@ impl Notification {
             }
             "blockchain.scripthash.subscribe" => {
                 ScriptHashNotification::deserialize(params).map(Notification::ScriptHash)
+            }
+            #[cfg(feature = "frigate")]
+            "blockchain.silentpayments.subscribe" => {
+                SpNotification::deserialize(params).map(Notification::SpSubscribe)
             }
             _ => Ok(Notification::Unknown(raw.clone())),
         }
@@ -101,4 +111,31 @@ impl ScriptHashNotification {
     pub fn script_status(&self) -> Option<ElectrumScriptStatus> {
         self.param_1
     }
+}
+
+#[cfg(feature = "frigate")]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SpSubscription {
+    pub address: String,
+    pub labels: Vec<u32>,
+    pub start_height: u32,
+}
+
+#[cfg(feature = "frigate")]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct TxTweak {
+    pub height: u32,
+    pub tx_hash: bitcoin::Txid,
+    pub tweak_key: bitcoin::secp256k1::PublicKey,
+}
+
+/// A notification indicating new confirmed transactions
+///
+/// Corresponds to `"blockchain.silentpayments.subscribe"` Frigate Electrum notification method
+#[cfg(feature = "frigate")]
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SpNotification {
+    pub subscription: SpSubscription,
+    pub progress: f32,
+    pub history: Vec<TxTweak>,
 }

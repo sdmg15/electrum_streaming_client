@@ -82,6 +82,7 @@ macro_rules! gen_pending_request_types {
     };
 }
 
+#[cfg(not(feature = "frigate"))]
 gen_pending_request_types! {
     Header,
     HeaderWithProof,
@@ -104,6 +105,33 @@ gen_pending_request_types! {
     Banner,
     Ping,
     Custom
+}
+
+#[cfg(feature = "frigate")]
+gen_pending_request_types! {
+    Header,
+    HeaderWithProof,
+    Headers,
+    HeadersWithCheckpoint,
+    EstimateFee,
+    HeadersSubscribe,
+    RelayFee,
+    GetBalance,
+    GetHistory,
+    GetMempool,
+    ListUnspent,
+    ScriptHashSubscribe,
+    ScriptHashUnsubscribe,
+    BroadcastTx,
+    GetTx,
+    GetTxMerkle,
+    GetTxidFromPos,
+    GetFeeHistogram,
+    Banner,
+    Ping,
+    Version,
+    SpSubscribe,
+    SpUnSubscribe
 }
 
 type Handler =
